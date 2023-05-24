@@ -82,7 +82,6 @@ class PatientListViewModel(application: Application, private val fhirEngine: Fhi
           }
         )
       }
-      filterCity(this)
     }
   }
 
@@ -99,7 +98,6 @@ class PatientListViewModel(application: Application, private val fhirEngine: Fhi
             }
           )
         }
-        filterCity(this)
         sort(Patient.GIVEN, Order.ASCENDING)
         count = 100
         from = 0
