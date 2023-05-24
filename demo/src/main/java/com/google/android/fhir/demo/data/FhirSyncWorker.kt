@@ -27,7 +27,7 @@ class FhirSyncWorker(appContext: Context, workerParams: WorkerParameters) :
   FhirSyncWorker(appContext, workerParams) {
 
   override fun getDownloadWorkManager(): DownloadWorkManager {
-    return LimitedPatientResourcesDownloadWorkManagerImpl(FhirApplication.dataStore(applicationContext))
+    return LimitedPatientBundledResourcesDownloadWorkManagerImpl(FhirApplication.dataStore(applicationContext))
   }
 
   override fun getConflictResolver() = AcceptLocalConflictResolver

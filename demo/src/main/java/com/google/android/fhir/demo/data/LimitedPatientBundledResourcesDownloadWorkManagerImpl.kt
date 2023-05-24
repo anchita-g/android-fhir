@@ -29,31 +29,40 @@ import java.util.*
 import kotlin.collections.HashSet
 
 
-class LimitedPatientResourcesDownloadWorkManagerImpl(dataStore: DemoDataStore) : DownloadWorkManager {
+class LimitedPatientBundledResourcesDownloadWorkManagerImpl(dataStore: DemoDataStore) : DownloadWorkManager {
   private var downloadSize = 100
+  private val bundleSearchRequestSize = 50 // number of search request at once in a bundle
+  private val practitionerOrOrganisationSearchSize = 20
   private var maxResourceDownloadCount = hashMapOf<ResourceType, Int> (
-    ResourceType.Patient to 200,
+    ResourceType.Patient to 100,
     ResourceType.Observation to 20,
     ResourceType.Encounter to 25,
     ResourceType.Immunization to 10,
   )
-  private val urls = LinkedList(listOf((enforceCount("Patient", getDownloadCount(ResourceType.Patient)))))
+  private val requests:LinkedList<Request> = LinkedList(listOf(Request.of(enforceCount("Patient", getDownloadCount(ResourceType.Patient)))))
   private var resourceDownloadedCount = 0
   private var urlsHit = 0
   private var startTime = LocalDateTime.now()
   private var currentPatientsDownloaded = 0
   private var resourcesDownloaded = HashMap<ResourceType, HashSet<String>>()
   private var resourcesDownloadedCountMap = HashMap<ResourceType, Int>()
-
+  private var practitionerIds = HashSet<String>()
+  private var organisationIds = HashSet<String>()
+  private var downloadedEncounterMetadata = false
 
   private fun getDownloadCount(resourceType: ResourceType): Int {
     return if (maxResourceDownloadCount.get(resourceType)!! > downloadSize) downloadSize else maxResourceDownloadCount.get(resourceType)!!
   }
 
   override suspend fun getNextRequest(): Request? {
-    val url = urls.poll()
+    val request = requests.poll()
     urlsHit+=1
-    if (url == null) {
+    if (request == null) {
+      if (!downloadedEncounterMetadata) {
+        createPractitionerAndOrganisationDownloadRequests()
+        downloadedEncounterMetadata = true
+        return requests.poll()
+      }
       val nowTime = LocalDateTime.now()
       val timeElapsed = ChronoUnit.MILLIS.between(startTime, nowTime)
       Timber.i("Downloaded $resourceDownloadedCount in $timeElapsed millis over $urlsHit url hits")
@@ -62,7 +71,7 @@ class LimitedPatientResourcesDownloadWorkManagerImpl(dataStore: DemoDataStore) :
       }
       return null
     }
-    return Request.Companion.of(url)
+    return request
   }
 
   override suspend fun getSummaryRequestUrls(): Map<ResourceType, String> {
@@ -85,7 +94,7 @@ class LimitedPatientResourcesDownloadWorkManagerImpl(dataStore: DemoDataStore) :
         val reference = Reference(entry.item.reference)
         if (reference.referenceElement.resourceType.equals("Patient")) {
           val patientUrl = "${entry.item.reference}/\$everything"
-          urls.add(patientUrl)
+          requests.add(Request.of(patientUrl))
         }
       }
     }
@@ -100,12 +109,17 @@ class LimitedPatientResourcesDownloadWorkManagerImpl(dataStore: DemoDataStore) :
     // If the resource returned is a Bundle, check to see if there is a "next" relation referenced
     // in the Bundle.link component, if so, append the URL referenced to list of URLs to download.
     if (response is Bundle) {
+      response.entry.forEach {
+        if (it.resource.hasType(ResourceType.Bundle.name)) {
+          processResponse(it.resource)
+        }
+      }
       updateResourceCount(response)
-      addNextUrls(response)
+      addNextRequests(response)
       val nextUrl = response.link.firstOrNull { component -> component.relation == "next" }?.url
       if (nextUrl != null) {
         if (shouldFetchNextUrl(response)) {
-          urls.add(nextUrl)
+          requests.add(Request.Companion.of(nextUrl))
         }
       }
     }
@@ -129,12 +143,12 @@ class LimitedPatientResourcesDownloadWorkManagerImpl(dataStore: DemoDataStore) :
     return true
   }
 
-  private fun addNextUrls(bundle: Bundle) {
+  private fun addNextRequests(bundle: Bundle) {
     if (bundle.entry.all { it.resource.hasType(ResourceType.Patient.name) }) {
       addPatientEncounterResourceDownloadUrlsFromBundle(bundle)
     }
     if (bundle.entry.all { it.resource.hasType(ResourceType.Encounter.name) }) {
-      addEncounterRelatedResourceDownloadUrlsFromBundle(bundle)
+      extractEncounterRelatedResourceDownloadUrlsFromBundle(bundle)
     }
   }
 
@@ -161,37 +175,120 @@ class LimitedPatientResourcesDownloadWorkManagerImpl(dataStore: DemoDataStore) :
 
    private fun addPatientEncounterResourceDownloadUrlsFromBundle(bundle: Bundle) {
      currentPatientsDownloaded+=bundle.entry.size
-    // Extract the patient resources from the bundle and append the URLs for the related resources to fetch for each of these patients
-    bundle.entry.filter {
-      ResourceType.fromCode(it.resource.fhirType()) == ResourceType.Patient
-    }.forEach {
-      val urlSplit = it.fullUrl.split("/")
-      val patientId = urlSplit[urlSplit.size - 1]
-      urls.add(enforceCount("Encounter?subject=${patientId}&_sort=_lastUpdated", getDownloadCount(ResourceType.Encounter)))
-      urls.add(enforceCount("Observation?subject=${patientId}&_sort=_lastUpdated", getDownloadCount(ResourceType.Observation)))
-      urls.add(enforceCount("Immunization?patient=${patientId}&_sort=_lastUpdated", getDownloadCount(ResourceType.Immunization)))
-    }
+     // Extract the patient resources from the bundle and append the URLs for the related resources to fetch for each of these patients
+     bundle.entry.filter {
+       ResourceType.fromCode(it.resource.fhirType()) == ResourceType.Patient
+     }.chunked(bundleSearchRequestSize).forEach { chunkedPatients ->
+       val observationSearchBundle = Bundle()
+       observationSearchBundle
+         .setType(Bundle.BundleType.BATCH)
+         .setId(UUID.randomUUID().toString())
+       val encounterSearchBundle = Bundle()
+       encounterSearchBundle
+         .setType(Bundle.BundleType.BATCH)
+         .setId(UUID.randomUUID().toString())
+       val immunizationSearchBundle = Bundle()
+       immunizationSearchBundle
+         .setType(Bundle.BundleType.BATCH)
+         .setId(UUID.randomUUID().toString())
+       chunkedPatients.forEach {
+         val urlSplit = it.fullUrl.split("/")
+         val patientId = urlSplit[urlSplit.size - 1]
+         val observationRequest =
+           Bundle.BundleEntryRequestComponent().setMethod(Bundle.HTTPVerb.GET).setUrl(
+             enforceCount(
+               "Observation?subject=${patientId}&_sort=_lastUpdated",
+               getDownloadCount(ResourceType.Observation)
+             )
+           )
+         val encounterRequest = Bundle.BundleEntryRequestComponent().setMethod(Bundle.HTTPVerb.GET)
+           .setUrl(
+             enforceCount(
+               "Encounter?subject=${patientId}&_sort=_lastUpdated",
+               getDownloadCount(ResourceType.Encounter)
+             )
+           )
+         val immunizationRequest =
+           Bundle.BundleEntryRequestComponent().setMethod(Bundle.HTTPVerb.GET).setUrl(
+             enforceCount(
+               "Immunization?patient=${patientId}&_sort=_lastUpdated",
+               getDownloadCount(ResourceType.Immunization)
+             )
+           )
+         observationSearchBundle.addEntry(
+           Bundle.BundleEntryComponent().setRequest(observationRequest)
+         )
+         encounterSearchBundle.addEntry(Bundle.BundleEntryComponent().setRequest(encounterRequest))
+         immunizationSearchBundle.addEntry(
+           Bundle.BundleEntryComponent().setRequest(immunizationRequest)
+         )
+       }
+       requests.add(Request.of(observationSearchBundle))
+       requests.add(Request.of(encounterSearchBundle))
+       requests.add(Request.of(immunizationSearchBundle))
+     }
   }
 
-
-
-  private fun addEncounterRelatedResourceDownloadUrlsFromBundle(bundle: Bundle) {
+  private fun extractEncounterRelatedResourceDownloadUrlsFromBundle(bundle: Bundle) {
     // Extract the encounter resources from the bundle and append the URLs for the encounters related resources
     val encounters = bundle.entry.filter {
       ResourceType.fromCode(it.resource.fhirType()) == ResourceType.Encounter
     }.map { it.resource as Encounter }
-    val practitionerIds = encounters.map {encounter ->
+    val pIds = encounters.map {encounter ->
       encounter.participant
         .filter { it.individual.referenceElement.hasResourceType() }
         .filter { it.individual.referenceElement.resourceType == ResourceType.Practitioner.name }
         .map { it.individual.referenceElement.idPart }
     }.flatten().distinct()
-    val organizationIds = encounters.map { encounter ->
+    val oIds = encounters.map { encounter ->
       encounter.serviceProvider.referenceElement.idPart
     }.distinct()
-    urls.add("Practitioner?_id=${practitionerIds.joinToString(",")}")
-    urls.add("Organization?_id=${organizationIds.joinToString(",")}")
+    practitionerIds.addAll(pIds)
+    organisationIds.addAll(oIds)
+  }
 
+  private fun createPractitionerAndOrganisationDownloadRequests() {
+    practitionerIds.chunked(practitionerOrOrganisationSearchSize).chunked(bundleSearchRequestSize).forEach {
+        practitionerIdsChunks ->
+    val practitionerSearchBundle = Bundle()
+      practitionerSearchBundle
+        .setType(Bundle.BundleType.BATCH)
+        .setId(UUID.randomUUID().toString())
+      practitionerIdsChunks.forEach { pIds ->
+        val practitionerRequest =
+          Bundle.BundleEntryRequestComponent().setMethod(Bundle.HTTPVerb.GET).setUrl(
+            enforceCount(
+              "Practitioner?_id=${pIds.joinToString(",")}",
+              pIds.size
+            )
+          )
+        practitionerSearchBundle.addEntry(
+          Bundle.BundleEntryComponent().setRequest(practitionerRequest)
+        )
+      }
+      requests.add(Request.Companion.of(practitionerSearchBundle))
+    }
+
+    organisationIds.chunked(practitionerOrOrganisationSearchSize).chunked(bundleSearchRequestSize).forEach {
+        organisationIdsChunks ->
+      val organisationSearchBundle = Bundle()
+      organisationSearchBundle
+        .setType(Bundle.BundleType.BATCH)
+        .setId(UUID.randomUUID().toString())
+      organisationIdsChunks.forEach { oIds ->
+        val organisationRequest =
+          Bundle.BundleEntryRequestComponent().setMethod(Bundle.HTTPVerb.GET).setUrl(
+            enforceCount(
+              "Organization?_id=${oIds.joinToString(",")}",
+              oIds.size
+            )
+          )
+        organisationSearchBundle.addEntry(
+          Bundle.BundleEntryComponent().setRequest(organisationRequest)
+        )
+      }
+      requests.add(Request.Companion.of(organisationSearchBundle))
+    }
   }
 }
 
