@@ -28,6 +28,7 @@ class FhirSyncWorker(appContext: Context, workerParams: WorkerParameters) :
 
   override fun getDownloadWorkManager(): DownloadWorkManager {
     return TimestampBasedDownloadWorkManagerImpl(
+      getFhirEngine(),
       FhirApplication.dataStore(applicationContext),
       FhirApplication.carePlanManager(applicationContext)
     )

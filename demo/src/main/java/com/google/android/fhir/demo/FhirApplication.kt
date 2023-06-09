@@ -37,7 +37,7 @@ import com.google.android.fhir.workflow.TaskManager
 import timber.log.Timber
 
 class FhirApplication : Application(), DataCaptureConfig.Provider {
-  private val BASE_URL = "http://10.0.2.2:8088/fhir/"
+  private val BASE_URL = "http://10.0.2.2:8080/fhir/"
   // Only initiate the FhirEngine when used for the first time, not when the app is created.
   private val fhirEngine: FhirEngine by lazy { constructFhirEngine() }
   private val fhirOperator: FhirOperator by lazy { constructFhirOperator() }
@@ -49,9 +49,8 @@ class FhirApplication : Application(), DataCaptureConfig.Provider {
 
   override fun onCreate() {
     super.onCreate()
-    if (BuildConfig.DEBUG) {
-      Timber.plant(Timber.DebugTree())
-    }
+    Timber.plant(Timber.DebugTree())
+
     FhirEngineProvider.init(
       FhirEngineConfiguration(
         enableEncryptionIfSupported = false,
@@ -61,7 +60,7 @@ class FhirApplication : Application(), DataCaptureConfig.Provider {
           httpLogger =
             HttpLogger(
               HttpLogger.Configuration(
-                if (BuildConfig.DEBUG) HttpLogger.Level.BODY else HttpLogger.Level.BASIC
+                HttpLogger.Level.BODY
               )
             ) { Timber.tag("App-HttpLog").d(it) }
         )
